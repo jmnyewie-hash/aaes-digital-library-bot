@@ -1,0 +1,10 @@
+.env
+credentials.json
+client_secret*.json
+token.json
+**pycache**/
+*.py[cod]
+.venv/
+venv/
+.vscode/
+*.log
