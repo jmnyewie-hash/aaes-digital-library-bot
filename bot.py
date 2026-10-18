@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -38,11 +39,9 @@ from telegram.ext import (
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
 load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-
 ROOT_FOLDER_ID = "1kipRzamreuK0X43kXT1dzFp77MetA45G"
 
 GOOGLE_SCOPES = [
@@ -51,6 +50,15 @@ GOOGLE_SCOPES = [
 
 GOOGLE_TOKEN_FILE = BASE_DIR / "token.json"
 GOOGLE_CREDENTIALS_FILE = BASE_DIR / "credentials.json"
+
+# Set LIBRARY_CACHE_DB to a persistent disk path on your host if
+# the platform does not preserve files in the application directory.
+CACHE_DB_FILE = Path(
+    os.getenv(
+        "LIBRARY_CACHE_DB",
+        str(BASE_DIR / "telegram_file_cache.sqlite3"),
+    )
+).expanduser()
 
 CACHE_DURATION = 60
 ITEMS_PER_PAGE = 8
@@ -63,7 +71,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
 logger = logging.getLogger("AAES_LIBRARY")
 
 
@@ -90,49 +97,31 @@ def get_drive_service():
     On FadeHost, GOOGLE_TOKEN_JSON_BASE64 should contain the
     Base64-encoded contents of a valid Google OAuth token.json.
     """
-
     global drive_service
 
     if drive_service is not None:
         return drive_service
 
     with drive_lock:
-
         if drive_service is not None:
             return drive_service
 
         credentials = None
+        encoded_token = os.getenv("GOOGLE_TOKEN_JSON_BASE64", "").strip()
 
-        # ----------------------------------------------------
-        # OPTION 1: LOAD TOKEN FROM DEPLOYMENT ENVIRONMENT
-        # ----------------------------------------------------
-
-        encoded_token = os.getenv(
-            "GOOGLE_TOKEN_JSON_BASE64",
-            "",
-        ).strip()
-
+        # Option 1: token supplied through the hosting environment.
         if encoded_token:
-
             try:
                 decoded_token = base64.b64decode(
                     encoded_token,
                     validate=True,
                 )
-
-                token_info = json.loads(
-                    decoded_token.decode("utf-8")
-                )
-
+                token_info = json.loads(decoded_token.decode("utf-8"))
                 credentials = Credentials.from_authorized_user_info(
                     token_info,
                     GOOGLE_SCOPES,
                 )
-
-                logger.info(
-                    "Google OAuth token loaded from environment."
-                )
-
+                logger.info("Google OAuth token loaded from environment.")
             except (
                 ValueError,
                 UnicodeDecodeError,
@@ -140,119 +129,75 @@ def get_drive_service():
                 TypeError,
                 KeyError,
             ) as exc:
-
                 raise RuntimeError(
-                    "GOOGLE_TOKEN_JSON_BASE64 is invalid. "
-                    "Check that FadeHost contains the complete "
-                    "Base64-encoded contents of token.json."
+                    "GOOGLE_TOKEN_JSON_BASE64 is invalid. Check that "
+                    "FadeHost contains the complete Base64-encoded "
+                    "contents of token.json."
                 ) from exc
 
-        # ----------------------------------------------------
-        # OPTION 2: LOAD LOCAL TOKEN.JSON
-        # ----------------------------------------------------
-
+        # Option 2: local token file.
         elif GOOGLE_TOKEN_FILE.exists():
-
             try:
                 credentials = Credentials.from_authorized_user_file(
                     str(GOOGLE_TOKEN_FILE),
                     GOOGLE_SCOPES,
                 )
-
-                logger.info(
-                    "Google OAuth token loaded from local token.json."
-                )
-
+                logger.info("Google OAuth token loaded from local token.json.")
             except (
                 ValueError,
                 json.JSONDecodeError,
                 KeyError,
                 TypeError,
             ) as exc:
-
                 raise RuntimeError(
                     "The local token.json file is invalid. "
                     "Generate a new Google OAuth token."
                 ) from exc
 
-        # ----------------------------------------------------
-        # REFRESH EXPIRED CREDENTIALS
-        # ----------------------------------------------------
-
+        # Refresh expired credentials where possible.
         if credentials and credentials.expired:
-
             if credentials.refresh_token:
-
                 try:
                     credentials.refresh(Request())
-
-                    logger.info(
-                        "Google OAuth credentials refreshed."
-                    )
-
+                    logger.info("Google OAuth credentials refreshed.")
                 except Exception as exc:
-
                     raise RuntimeError(
-                        "Google OAuth token refresh failed. "
-                        "The token may have expired or been revoked. "
-                        "Reauthorize Google Drive access and provide "
-                        "an updated token."
+                        "Google OAuth token refresh failed. The token may "
+                        "have expired or been revoked. Reauthorize Google "
+                        "Drive access and provide an updated token."
                     ) from exc
-
             else:
-
                 credentials = None
-
                 logger.warning(
-                    "Google OAuth credentials expired without "
-                    "a refresh token."
+                    "Google OAuth credentials expired without a refresh token."
                 )
 
-        # ----------------------------------------------------
-        # VERIFY CREDENTIALS
-        # ----------------------------------------------------
-
+        # Option 3: local interactive OAuth, only if a credentials file exists.
         if not credentials or not credentials.valid:
-
-            # On a deployment server, interactive authentication
-            # is normally unavailable. Never attempt to open a
-            # browser automatically unless a local credentials
-            # file is present.
-
             if not GOOGLE_CREDENTIALS_FILE.exists():
-
                 raise RuntimeError(
-                    "Google Drive authentication is unavailable. "
-                    "Set GOOGLE_TOKEN_JSON_BASE64 in the hosting "
-                    "environment using a valid token.json, or "
-                    "provide credentials.json for local OAuth setup."
+                    "Google Drive authentication is unavailable. Set "
+                    "GOOGLE_TOKEN_JSON_BASE64 in the hosting environment "
+                    "using a valid token.json, or provide credentials.json "
+                    "for local OAuth setup."
                 )
-
-            # ------------------------------------------------
-            # OPTION 3: LOCAL INTERACTIVE OAUTH
-            # ------------------------------------------------
 
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(GOOGLE_CREDENTIALS_FILE),
                 GOOGLE_SCOPES,
             )
+            credentials = flow.run_local_server(port=0)
 
-            credentials = flow.run_local_server(
-                port=0
+        # Save refreshed/local credentials where the filesystem permits it.
+        try:
+            GOOGLE_TOKEN_FILE.write_text(
+                credentials.to_json(),
+                encoding="utf-8",
             )
-
-        # ----------------------------------------------------
-        # SAVE TOKEN LOCALLY
-        # ----------------------------------------------------
-
-        GOOGLE_TOKEN_FILE.write_text(
-            credentials.to_json(),
-            encoding="utf-8",
-        )
-
-        # ----------------------------------------------------
-        # BUILD GOOGLE DRIVE SERVICE
-        # ----------------------------------------------------
+        except OSError:
+            logger.warning(
+                "Could not save token.json locally; continuing with in-memory credentials."
+            )
 
         drive_service = build(
             "drive",
@@ -260,17 +205,12 @@ def get_drive_service():
             credentials=credentials,
             cache_discovery=False,
         )
-
-        logger.info(
-            "Google Drive API service initialized successfully."
-        )
-
+        logger.info("Google Drive API service initialized successfully.")
         return drive_service
 
 
 def get_folder_metadata(folder_id):
     service = get_drive_service()
-
     return (
         service.files()
         .get(
@@ -283,37 +223,100 @@ def get_folder_metadata(folder_id):
 
 
 # ============================================================
+# PERSISTENT TELEGRAM FILE CACHE
+# ============================================================
+
+def init_file_cache():
+    """Create the SQLite cache table if it does not already exist."""
+    CACHE_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(CACHE_DB_FILE, timeout=20) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_file_cache (
+                drive_file_id TEXT PRIMARY KEY,
+                telegram_file_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                file_size INTEGER,
+                cached_at REAL NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+    logger.info("Telegram file cache database ready: %s", CACHE_DB_FILE)
+
+
+def get_cached_file(drive_file_id):
+    """Return a cached Telegram file mapping, or None."""
+    with sqlite3.connect(CACHE_DB_FILE, timeout=20) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT drive_file_id, telegram_file_id, filename, file_size, cached_at
+            FROM telegram_file_cache
+            WHERE drive_file_id = ?
+            """,
+            (drive_file_id,),
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def save_cached_file(drive_file_id, telegram_file_id, filename, file_size):
+    """Persist a successful Telegram upload for reuse by later requests."""
+    with sqlite3.connect(CACHE_DB_FILE, timeout=20) as connection:
+        connection.execute(
+            """
+            INSERT INTO telegram_file_cache
+                (drive_file_id, telegram_file_id, filename, file_size, cached_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(drive_file_id) DO UPDATE SET
+                telegram_file_id = excluded.telegram_file_id,
+                filename = excluded.filename,
+                file_size = excluded.file_size,
+                cached_at = excluded.cached_at
+            """,
+            (
+                drive_file_id,
+                telegram_file_id,
+                filename,
+                file_size,
+                time.time(),
+            ),
+        )
+        connection.commit()
+
+
+def delete_cached_file(drive_file_id):
+    with sqlite3.connect(CACHE_DB_FILE, timeout=20) as connection:
+        connection.execute(
+            "DELETE FROM telegram_file_cache WHERE drive_file_id = ?",
+            (drive_file_id,),
+        )
+        connection.commit()
+
+
+# ============================================================
 # DIRECTORY BROWSER
 # ============================================================
 
 def list_folder_contents(folder_id, force_refresh=False):
-    """
-    Retrieve only the immediate contents of one Drive folder.
-
-    The entire library is not recursively indexed.
-    """
-
+    """Retrieve only the immediate contents of one Drive folder."""
     now = time.monotonic()
 
     if not force_refresh:
-
         with cache_lock:
-
             cached = folder_cache.get(folder_id)
-
             if cached and now - cached["time"] < CACHE_DURATION:
-                return [
-                    dict(item)
-                    for item in cached["items"]
-                ]
+                return [dict(item) for item in cached["items"]]
 
     service = get_drive_service()
-
     items = []
     page_token = None
 
     while True:
-
         response = (
             service.files()
             .list(
@@ -324,10 +327,7 @@ def list_folder_contents(folder_id, force_refresh=False):
                 fields=(
                     "nextPageToken,"
                     "files("
-                    "id,"
-                    "name,"
-                    "mimeType,"
-                    "size,"
+                    "id,name,mimeType,size,"
                     "shortcutDetails(targetId,targetMimeType)"
                     ")"
                 ),
@@ -337,50 +337,29 @@ def list_folder_contents(folder_id, force_refresh=False):
             .execute()
         )
 
-        items.extend(
-            response.get("files", [])
-        )
-
+        items.extend(response.get("files", []))
         page_token = response.get("nextPageToken")
-
         if not page_token:
             break
 
-    # --------------------------------------------------------
-    # SORT FOLDERS BEFORE DOCUMENTS
-    # --------------------------------------------------------
-
     def sort_key(item):
-
         mime_type = item.get("mimeType")
-
         is_folder = (
             mime_type == FOLDER_MIME
             or (
                 mime_type == SHORTCUT_MIME
-                and item.get(
-                    "shortcutDetails", {}
-                ).get("targetMimeType") == FOLDER_MIME
+                and item.get("shortcutDetails", {}).get("targetMimeType")
+                == FOLDER_MIME
             )
         )
+        return (0 if is_folder else 1, item.get("name", "").casefold())
 
-        return (
-            0 if is_folder else 1,
-            item.get("name", "").casefold(),
-        )
-
-    items.sort(
-        key=sort_key
-    )
+    items.sort(key=sort_key)
 
     with cache_lock:
-
         folder_cache[folder_id] = {
             "time": time.monotonic(),
-            "items": [
-                dict(item)
-                for item in items
-            ],
+            "items": [dict(item) for item in items],
         }
 
     return items
@@ -390,52 +369,26 @@ def list_folder_contents(folder_id, force_refresh=False):
 # USER NAVIGATION
 # ============================================================
 
-# Each user's navigation history is stored separately.
-#
-# Key:
-#     (chat_id, user_id)
-#
-# Value:
-#     [(folder_id, folder_name), ...]
-
+# Navigation history is held separately for each (chat, user) pair.
 user_paths = {}
 user_paths_lock = threading.Lock()
 
 
 def get_user_key(update):
-
-    return (
-        update.effective_chat.id,
-        update.effective_user.id,
-    )
+    return (update.effective_chat.id, update.effective_user.id)
 
 
 def get_user_path(update):
-
     key = get_user_key(update)
-
     with user_paths_lock:
-
         if key not in user_paths:
-
-            user_paths[key] = [
-                (
-                    ROOT_FOLDER_ID,
-                    "AAES DIGITAL LIBRARY",
-                )
-            ]
-
-        return list(
-            user_paths[key]
-        )
+            user_paths[key] = [(ROOT_FOLDER_ID, "AAES DIGITAL LIBRARY")]
+        return list(user_paths[key])
 
 
 def set_user_path(update, path):
-
     key = get_user_key(update)
-
     with user_paths_lock:
-
         user_paths[key] = list(path)
 
 
@@ -444,7 +397,6 @@ def set_user_path(update, path):
 # ============================================================
 
 def main_menu_keyboard():
-
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -462,98 +414,57 @@ def main_menu_keyboard():
 
 
 def navigation_buttons(can_go_back):
-
     buttons = []
 
     if can_go_back:
-
         buttons.append(
-            InlineKeyboardButton(
-                "⬅️ Back",
-                callback_data="nav:back",
-            )
+            InlineKeyboardButton("⬅️ Back", callback_data="nav:back")
         )
 
     buttons.extend([
-        InlineKeyboardButton(
-            "🏠 Main Menu",
-            callback_data="nav:home",
-        ),
-        InlineKeyboardButton(
-            "🔄 Refresh",
-            callback_data="nav:refresh",
-        ),
+        InlineKeyboardButton("🏠 Main Menu", callback_data="nav:home"),
+        InlineKeyboardButton("🔄 Refresh", callback_data="nav:refresh"),
     ])
-
     return buttons
 
 
 def make_folder_keyboard(items, page, can_go_back):
-
     start = page * ITEMS_PER_PAGE
-    end = start + ITEMS_PER_PAGE
-
-    visible_items = items[start:end]
-
+    visible_items = items[start:start + ITEMS_PER_PAGE]
     keyboard = []
 
     for item in visible_items:
-
         item_id = item["id"]
-
-        name = item.get(
-            "name",
-            "Unnamed document",
-        )
-
+        name = item.get("name", "Unnamed document")
         mime_type = item.get("mimeType")
-
-        shortcut_details = item.get(
-            "shortcutDetails",
-            {},
-        )
+        shortcut_details = item.get("shortcutDetails", {})
 
         is_folder = (
             mime_type == FOLDER_MIME
             or (
                 mime_type == SHORTCUT_MIME
-                and shortcut_details.get(
-                    "targetMimeType"
-                ) == FOLDER_MIME
+                and shortcut_details.get("targetMimeType") == FOLDER_MIME
             )
         )
 
-        label = (
-            "📁 " if is_folder else "📄 "
-        ) + name
-
+        label = ("📁 " if is_folder else "📄 ") + name
         if len(label) > 55:
             label = label[:54] + "…"
 
-        prefix = (
-            "folder" if is_folder else "file"
-        )
-
+        prefix = "folder" if is_folder else "file"
         keyboard.append([
-            InlineKeyboardButton(
-                label,
-                callback_data=f"{prefix}:{item_id}",
-            )
+            InlineKeyboardButton(label, callback_data=f"{prefix}:{item_id}")
         ])
 
     total_pages = max(
         1,
-        (
-            len(items) + ITEMS_PER_PAGE - 1
-        ) // ITEMS_PER_PAGE,
+        (len(items) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE,
     )
 
     if total_pages > 1:
-
         page_buttons = []
 
         if page > 0:
-
             page_buttons.append(
                 InlineKeyboardButton(
                     "⬅️ Previous",
@@ -569,7 +480,6 @@ def make_folder_keyboard(items, page, can_go_back):
         )
 
         if page + 1 < total_pages:
-
             page_buttons.append(
                 InlineKeyboardButton(
                     "Next ➡️",
@@ -579,10 +489,7 @@ def make_folder_keyboard(items, page, can_go_back):
 
         keyboard.append(page_buttons)
 
-    keyboard.append(
-        navigation_buttons(can_go_back)
-    )
-
+    keyboard.append(navigation_buttons(can_go_back))
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -591,32 +498,19 @@ def make_folder_keyboard(items, page, can_go_back):
 # ============================================================
 
 def create_folder_message(path, items):
-
     current_name = path[-1][1]
-
-    breadcrumb = " › ".join(
-        name for _, name in path
-    )
-
+    breadcrumb = " › ".join(name for _, name in path)
     folders = 0
     files = 0
 
     for item in items:
-
         mime_type = item.get("mimeType")
-
-        shortcut = item.get(
-            "shortcutDetails",
-            {},
-        )
-
+        shortcut = item.get("shortcutDetails", {})
         is_folder = (
             mime_type == FOLDER_MIME
             or (
                 mime_type == SHORTCUT_MIME
-                and shortcut.get(
-                    "targetMimeType"
-                ) == FOLDER_MIME
+                and shortcut.get("targetMimeType") == FOLDER_MIME
             )
         )
 
@@ -630,16 +524,11 @@ def create_folder_message(path, items):
         f"📍 {html.escape(breadcrumb)}\n\n"
         f"📁 Folders: {folders}\n"
         f"📄 Files: {files}\n\n"
-        "Select a folder to open it, or select a document "
-        "to download it."
+        "Select a folder to open it, or select a document to download it."
     )
 
     if not items:
-
-        message += (
-            "\n\nThis folder is empty or contains "
-            "no accessible items."
-        )
+        message += "\n\nThis folder is empty or contains no accessible items."
 
     return message
 
@@ -651,13 +540,10 @@ async def display_folder(
     force_refresh=False,
     edit_message=False,
 ):
-
     path = get_user_path(update)
-
     folder_id = path[-1][0]
 
     try:
-
         items = await asyncio.to_thread(
             list_folder_contents,
             folder_id,
@@ -666,37 +552,20 @@ async def display_folder(
 
         total_pages = max(
             1,
-            (
-                len(items) + ITEMS_PER_PAGE - 1
-            ) // ITEMS_PER_PAGE,
+            (len(items) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE,
         )
+        page = max(0, min(page, total_pages - 1))
 
-        page = max(
-            0,
-            min(page, total_pages - 1),
-        )
-
-        message = create_folder_message(
-            path,
-            items,
-        )
-
-        keyboard = make_folder_keyboard(
-            items,
-            page,
-            len(path) > 1,
-        )
+        message = create_folder_message(path, items)
+        keyboard = make_folder_keyboard(items, page, len(path) > 1)
 
         if edit_message:
-
             await update.callback_query.edit_message_text(
                 message,
                 reply_markup=keyboard,
                 parse_mode="HTML",
             )
-
         else:
-
             await update.effective_message.reply_text(
                 message,
                 reply_markup=keyboard,
@@ -704,58 +573,35 @@ async def display_folder(
             )
 
     except HttpError:
-
-        logger.exception(
-            "Google Drive directory request failed"
-        )
-
+        logger.exception("Google Drive directory request failed")
         error_message = (
             "❌ I couldn't open this directory.\n\n"
             "Please check Google Drive permissions and try Refresh."
         )
 
         if edit_message:
-
-            await update.callback_query.edit_message_text(
-                error_message
-            )
-
+            await update.callback_query.edit_message_text(error_message)
         else:
-
-            await update.effective_message.reply_text(
-                error_message
-            )
+            await update.effective_message.reply_text(error_message)
 
     except Exception:
-
-        logger.exception(
-            "Unexpected directory error"
-        )
-
+        logger.exception("Unexpected directory error")
         error_message = (
             "❌ Something went wrong while opening this directory. "
             "Please try again."
         )
 
         if edit_message:
-
-            await update.callback_query.edit_message_text(
-                error_message
-            )
-
+            await update.callback_query.edit_message_text(error_message)
         else:
-
-            await update.effective_message.reply_text(
-                error_message
-            )
+            await update.effective_message.reply_text(error_message)
 
 
 # ============================================================
-# DOWNLOADS
+# DOWNLOAD FROM GOOGLE DRIVE
 # ============================================================
 
 def download_file(file_id):
-
     service = get_drive_service()
 
     metadata = (
@@ -768,22 +614,11 @@ def download_file(file_id):
         .execute()
     )
 
-    # --------------------------------------------------------
-    # RESOLVE GOOGLE DRIVE SHORTCUTS
-    # --------------------------------------------------------
-
+    # Resolve shortcuts before downloading.
     if metadata.get("mimeType") == SHORTCUT_MIME:
-
-        target_id = metadata.get(
-            "shortcutDetails",
-            {},
-        ).get("targetId")
-
+        target_id = metadata.get("shortcutDetails", {}).get("targetId")
         if not target_id:
-
-            raise ValueError(
-                "This shortcut has no accessible target."
-            )
+            raise ValueError("This shortcut has no accessible target.")
 
         metadata = (
             service.files()
@@ -794,94 +629,56 @@ def download_file(file_id):
             )
             .execute()
         )
-
         file_id = target_id
 
-    name = metadata.get(
-        "name",
-        "document",
-    )
-
-    mime_type = metadata.get(
-        "mimeType",
-        "application/octet-stream",
-    )
-
+    name = metadata.get("name", "document")
+    mime_type = metadata.get("mimeType", "application/octet-stream")
     size = metadata.get("size")
 
     if size is not None:
-
         try:
-
             if int(size) > MAX_DOWNLOAD_BYTES:
-
                 raise ValueError(
                     "This file exceeds the bot's 45 MB download limit."
                 )
-
         except (TypeError, ValueError) as exc:
-
             if "45 MB" in str(exc):
                 raise
 
-    # --------------------------------------------------------
-    # GOOGLE WORKSPACE EXPORT HANDLING
-    # --------------------------------------------------------
-
+    # Export supported Google Workspace documents to common formats.
     export_mime = None
     extension = ""
 
     if mime_type == "application/vnd.google-apps.document":
-
         export_mime = "application/pdf"
         extension = ".pdf"
-
     elif mime_type == "application/vnd.google-apps.spreadsheet":
-
         export_mime = (
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
         extension = ".xlsx"
-
     elif mime_type == "application/vnd.google-apps.presentation":
-
         export_mime = "application/pdf"
         extension = ".pdf"
-
-    elif mime_type.startswith(
-        "application/vnd.google-apps."
-    ):
-
+    elif mime_type.startswith("application/vnd.google-apps."):
         raise ValueError(
-            "This Google Workspace document type "
-            "is not supported for download."
+            "This Google Workspace document type is not supported for download."
         )
 
     if export_mime:
-
         request = service.files().export_media(
             fileId=file_id,
             mimeType=export_mime,
         )
-
         if not name.lower().endswith(extension):
             name += extension
-
     else:
-
         request = service.files().get_media(
             fileId=file_id,
             supportsAllDrives=True,
         )
 
-    # --------------------------------------------------------
-    # DOWNLOAD FILE IN CHUNKS
-    # --------------------------------------------------------
-
     buffer = io.BytesIO()
-
     downloader = MediaIoBaseDownload(
         buffer,
         request,
@@ -889,20 +686,34 @@ def download_file(file_id):
     )
 
     done = False
-
     while not done:
-
         _, done = downloader.next_chunk()
-
         if buffer.tell() > MAX_DOWNLOAD_BYTES:
-
             raise ValueError(
                 "This file exceeds the bot's 45 MB download limit."
             )
 
     buffer.seek(0)
-
     return buffer, name
+
+
+# ============================================================
+# COMMON POST-DOWNLOAD MENU
+# ============================================================
+
+async def show_after_file_menu(context, chat_id):
+    """
+    Send a fresh menu after the document message.
+
+    This intentionally appears AFTER the file in the chat, so users can
+    continue browsing once the document has been delivered.
+    """
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="📚 <b>What would you like to do next?</b>",
+        reply_markup=main_menu_keyboard(),
+        parse_mode="HTML",
+    )
 
 
 # ============================================================
@@ -913,21 +724,15 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     set_user_path(
         update,
-        [
-            (
-                ROOT_FOLDER_ID,
-                "AAES DIGITAL LIBRARY",
-            )
-        ],
+        [(ROOT_FOLDER_ID, "AAES DIGITAL LIBRARY")],
     )
 
     await update.effective_message.reply_text(
         "📚 <b>WELCOME TO THE AAES DIGITAL LIBRARY!</b>\n\n"
-        "Browse your library using buttons. You do not need to "
-        "type book titles, course codes, or keywords.\n\n"
+        "Browse your library using buttons. You do not need to type "
+        "book titles, course codes, or keywords.\n\n"
         "Choose an option below.",
         reply_markup=main_menu_keyboard(),
         parse_mode="HTML",
@@ -938,18 +743,44 @@ async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     await update.effective_message.reply_text(
         "ℹ️ <b>HOW TO USE THE LIBRARY</b>\n\n"
         "1. Tap Browse Library.\n"
         "2. Select a folder.\n"
         "3. Continue until you reach the documents.\n"
         "4. Tap a document to download it.\n\n"
-        "Use Back to return to the previous folder, "
-        "Main Menu to start again, and Refresh to reload a folder.",
+        "Use Back to return to the previous folder, Main Menu to start "
+        "again, and Refresh to reload a folder.",
         reply_markup=main_menu_keyboard(),
         parse_mode="HTML",
     )
+
+
+# ============================================================
+# CALLBACK QUERY ACKNOWLEDGEMENT
+# ============================================================
+
+async def acknowledge_callback(query):
+    """
+    Acknowledge a button immediately, before any Drive calls or downloads.
+    An expired callback is logged and does not interrupt the action.
+    """
+    try:
+        await query.answer()
+    except BadRequest as exc:
+        error_text = str(exc).lower()
+        if (
+            "query is too old" in error_text
+            or "query id is invalid" in error_text
+            or "response timeout expired" in error_text
+        ):
+            logger.warning(
+                "Callback query expired before acknowledgement; continuing action."
+            )
+        else:
+            logger.warning("Could not acknowledge callback query: %s", exc)
+    except TelegramError:
+        logger.exception("Telegram failed to acknowledge callback query")
 
 
 # ============================================================
@@ -960,146 +791,78 @@ async def button_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     query = update.callback_query
-
-    action = query.data or ""
-
-    # --------------------------------------------------------
-    # MAIN MENU
-    # --------------------------------------------------------
-
-    if action == "menu:browse":
-
-        await query.answer()
-
-        set_user_path(
-            update,
-            [
-                (
-                    ROOT_FOLDER_ID,
-                    "AAES DIGITAL LIBRARY",
-                )
-            ],
-        )
-
-        await display_folder(
-            update,
-            context,
-            edit_message=True,
-        )
-
+    if query is None:
         return
 
+    # Crucially, acknowledge once and immediately. Do not call query.answer()
+    # again later in this handler, particularly after a long download.
+    await acknowledge_callback(query)
+    action = query.data or ""
+
+    # Main menu: browse.
+    if action == "menu:browse":
+        set_user_path(
+            update,
+            [(ROOT_FOLDER_ID, "AAES DIGITAL LIBRARY")],
+        )
+        await display_folder(update, context, edit_message=True)
+        return
+
+    # Main menu: help.
     if action == "menu:help":
-
-        await query.answer()
-
         await query.edit_message_text(
             "ℹ️ <b>HOW TO USE THE LIBRARY</b>\n\n"
             "1. Tap Browse Library.\n"
             "2. Select a folder.\n"
             "3. Continue until you reach the documents.\n"
             "4. Tap a document to download it.\n\n"
-            "Use Back to return to the previous folder, "
-            "Main Menu to start again, and Refresh to reload a folder.",
+            "Use Back to return to the previous folder, Main Menu to start "
+            "again, and Refresh to reload a folder.",
             reply_markup=main_menu_keyboard(),
             parse_mode="HTML",
         )
-
         return
 
-    # --------------------------------------------------------
-    # HOME
-    # --------------------------------------------------------
-
+    # Return to the main menu.
     if action == "nav:home":
-
-        await query.answer()
-
         set_user_path(
             update,
-            [
-                (
-                    ROOT_FOLDER_ID,
-                    "AAES DIGITAL LIBRARY",
-                )
-            ],
+            [(ROOT_FOLDER_ID, "AAES DIGITAL LIBRARY")],
         )
-
         await query.edit_message_text(
-            "📚 <b>AAES DIGITAL LIBRARY</b>\n\n"
-            "Choose an option:",
+            "📚 <b>AAES DIGITAL LIBRARY</b>\n\nChoose an option:",
             reply_markup=main_menu_keyboard(),
             parse_mode="HTML",
         )
-
         return
 
-    # --------------------------------------------------------
-    # BACK
-    # --------------------------------------------------------
-
+    # Navigate one folder upward.
     if action == "nav:back":
-
-        await query.answer()
-
         path = get_user_path(update)
-
         if len(path) > 1:
             path.pop()
-
-        set_user_path(
-            update,
-            path,
-        )
-
-        await display_folder(
-            update,
-            context,
-            edit_message=True,
-        )
-
+        set_user_path(update, path)
+        await display_folder(update, context, edit_message=True)
         return
 
-    # --------------------------------------------------------
-    # REFRESH
-    # --------------------------------------------------------
-
+    # Force-refresh current folder.
     if action == "nav:refresh":
-
-        await query.answer(
-            "Refreshing directory..."
-        )
-
         await display_folder(
             update,
             context,
             force_refresh=True,
             edit_message=True,
         )
-
         return
 
-    # --------------------------------------------------------
-    # PAGINATION
-    # --------------------------------------------------------
-
+    # Pagination.
     if action == "page:current":
-
-        await query.answer()
         return
 
     if action.startswith("page:"):
-
-        await query.answer()
-
         try:
-
-            page = int(
-                action.split(":", 1)[1]
-            )
-
+            page = int(action.split(":", 1)[1])
         except ValueError:
             return
 
@@ -1109,20 +872,11 @@ async def button_handler(
             page=page,
             edit_message=True,
         )
-
         return
 
-    # --------------------------------------------------------
-    # OPEN FOLDER
-    # --------------------------------------------------------
-
+    # Open a folder.
     if action.startswith("folder:"):
-
-        selected_id = action.split(
-            ":",
-            1,
-        )[1]
-
+        selected_id = action.split(":", 1)[1]
         path = get_user_path(update)
 
         items = await asyncio.to_thread(
@@ -1131,46 +885,32 @@ async def button_handler(
         )
 
         selected = next(
-            (
-                item for item in items
-                if item.get("id") == selected_id
-            ),
+            (item for item in items if item.get("id") == selected_id),
             None,
         )
 
         if not selected:
-
-            await query.answer(
-                "This folder is no longer available.",
-                show_alert=True,
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ This folder is no longer available. Please refresh the directory.",
             )
-
             return
 
         mime_type = selected.get("mimeType")
-
-        shortcut = selected.get(
-            "shortcutDetails",
-            {},
-        )
-
+        shortcut = selected.get("shortcutDetails", {})
         is_folder = (
             mime_type == FOLDER_MIME
             or (
                 mime_type == SHORTCUT_MIME
-                and shortcut.get(
-                    "targetMimeType"
-                ) == FOLDER_MIME
+                and shortcut.get("targetMimeType") == FOLDER_MIME
             )
         )
 
         if not is_folder:
-
-            await query.answer(
-                "This item is not a folder.",
-                show_alert=True,
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ This item is not a folder.",
             )
-
             return
 
         target_id = (
@@ -1180,50 +920,20 @@ async def button_handler(
         )
 
         if not target_id:
-
-            await query.answer(
-                "The folder shortcut has no accessible target.",
-                show_alert=True,
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ This folder shortcut has no accessible target.",
             )
-
             return
 
-        await query.answer()
-
-        path.append(
-            (
-                target_id,
-                selected.get(
-                    "name",
-                    "Folder",
-                ),
-            )
-        )
-
-        set_user_path(
-            update,
-            path,
-        )
-
-        await display_folder(
-            update,
-            context,
-            edit_message=True,
-        )
-
+        path.append((target_id, selected.get("name", "Folder")))
+        set_user_path(update, path)
+        await display_folder(update, context, edit_message=True)
         return
 
-    # --------------------------------------------------------
-    # DOWNLOAD FILE
-    # --------------------------------------------------------
-
+    # Download a file, using Telegram cache when possible.
     if action.startswith("file:"):
-
-        selected_id = action.split(
-            ":",
-            1,
-        )[1]
-
+        selected_id = action.split(":", 1)[1]
         path = get_user_path(update)
 
         items = await asyncio.to_thread(
@@ -1232,111 +942,128 @@ async def button_handler(
         )
 
         selected = next(
-            (
-                item for item in items
-                if item.get("id") == selected_id
-            ),
+            (item for item in items if item.get("id") == selected_id),
             None,
         )
 
         if not selected:
-
-            await query.answer(
-                "This document is no longer available.",
-                show_alert=True,
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ This document is no longer available. Please refresh the directory.",
             )
-
             return
 
         mime_type = selected.get("mimeType")
-
-        shortcut = selected.get(
-            "shortcutDetails",
-            {},
+        shortcut = selected.get("shortcutDetails", {})
+        is_folder = (
+            mime_type == FOLDER_MIME
+            or (
+                mime_type == SHORTCUT_MIME
+                and shortcut.get("targetMimeType") == FOLDER_MIME
+            )
         )
 
-        if mime_type == FOLDER_MIME or (
-            mime_type == SHORTCUT_MIME
-            and shortcut.get(
-                "targetMimeType"
-            ) == FOLDER_MIME
-        ):
-
-            await query.answer(
-                "Open this item as a folder instead.",
-                show_alert=True,
+        if is_folder:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Open this item as a folder instead.",
             )
-
             return
 
-        await query.answer(
-            "Preparing your document..."
-        )
+        chat_id = update.effective_chat.id
+        original_name = selected.get("name", "Document")
 
         status = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             text=(
                 "⏳ Preparing:\n"
-                f"<b>{html.escape(selected.get('name', 'Document'))}</b>"
+                f"<b>{html.escape(original_name)}</b>"
             ),
             parse_mode="HTML",
         )
 
+        # First try the persistent Telegram cache.
+        cached = await asyncio.to_thread(get_cached_file, selected_id)
+
+        if cached:
+            try:
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=ChatAction.UPLOAD_DOCUMENT,
+                )
+
+                cached_send_start = time.perf_counter()
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=cached["telegram_file_id"],
+                    caption=f"📥 {cached['filename']}",
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+                cached_send_elapsed = time.perf_counter() - cached_send_start
+
+                logger.info(
+                    "TELEGRAM CACHE HIT | File: %s | Send: %.2fs",
+                    cached["filename"],
+                    cached_send_elapsed,
+                )
+
+                await status.edit_text("✅ Your document has been sent.")
+                await show_after_file_menu(context, chat_id)
+                return
+
+            except BadRequest:
+                # A stale/unusable cached file_id should not permanently
+                # prevent the user from accessing the Drive source.
+                logger.warning(
+                    "Cached Telegram file_id rejected for Drive ID %s; "
+                    "removing cache entry and trying Google Drive.",
+                    selected_id,
+                )
+                await asyncio.to_thread(delete_cached_file, selected_id)
+
+            except TelegramError:
+                logger.exception("Telegram cache send failed.")
+                await status.edit_text(
+                    "❌ Telegram could not send the cached document. Please try again."
+                )
+                return
+
         try:
-
-            # Stage 1: Notify Telegram.
-
             await context.bot.send_chat_action(
-                chat_id=update.effective_chat.id,
+                chat_id=chat_id,
                 action=ChatAction.UPLOAD_DOCUMENT,
             )
 
-            # Stage 2: Download from Google Drive.
-
             logger.info(
                 "DOWNLOAD START | File: %s | ID: %s",
-                selected.get(
-                    "name",
-                    "Document",
-                ),
+                original_name,
                 selected_id,
             )
 
             download_start = time.perf_counter()
-
             buffer, filename = await asyncio.to_thread(
                 download_file,
                 selected_id,
             )
-
-            download_elapsed = (
-                time.perf_counter() - download_start
-            )
-
-            file_size_mb = (
-                buffer.getbuffer().nbytes
-                / (1024 * 1024)
-            )
+            download_elapsed = time.perf_counter() - download_start
+            file_size = buffer.getbuffer().nbytes
+            file_size_mb = file_size / (1024 * 1024)
 
             logger.info(
-                "DOWNLOAD COMPLETE | File: %s | Size: %.2f MB | "
-                "Time: %.2f seconds",
+                "DOWNLOAD COMPLETE | File: %s | Size: %.2f MB | Time: %.2fs",
                 filename,
                 file_size_mb,
                 download_elapsed,
             )
 
-            # Stage 3: Upload to Telegram.
-
-            logger.info(
-                "TELEGRAM UPLOAD START | File: %s",
-                filename,
-            )
-
+            logger.info("TELEGRAM UPLOAD START | File: %s", filename)
             upload_start = time.perf_counter()
 
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
+            sent_message = await context.bot.send_document(
+                chat_id=chat_id,
                 document=buffer,
                 filename=filename,
                 caption=f"📥 {filename}",
@@ -1346,73 +1073,86 @@ async def button_handler(
                 pool_timeout=30,
             )
 
-            upload_elapsed = (
-                time.perf_counter() - upload_start
-            )
-
+            upload_elapsed = time.perf_counter() - upload_start
             logger.info(
-                "TELEGRAM UPLOAD COMPLETE | File: %s | Time: %.2f seconds",
+                "TELEGRAM UPLOAD COMPLETE | File: %s | Time: %.2fs",
                 filename,
                 upload_elapsed,
             )
 
-            await status.edit_text(
-                "✅ Your document has been sent."
-            )
+            # Save the Telegram file_id only after a successful upload.
+            if sent_message.document and sent_message.document.file_id:
+                try:
+                    await asyncio.to_thread(
+                        save_cached_file,
+                        selected_id,
+                        sent_message.document.file_id,
+                        filename,
+                        file_size,
+                    )
+                    logger.info(
+                        "TELEGRAM CACHE SAVED | File: %s | Size: %.2f MB",
+                        filename,
+                        file_size_mb,
+                    )
+                except Exception:
+                    # Cache failure must not turn a successful delivery into
+                    # a failed download. The file was already sent to the user.
+                    logger.exception("Could not save Telegram cache entry.")
+
+            await status.edit_text("✅ Your document has been sent.")
 
             logger.info(
-                "DOWNLOAD PROCESS COMPLETE | File: %s | "
-                "Drive: %.2fs | Telegram: %.2fs | Total: %.2fs",
+                "DOWNLOAD PROCESS COMPLETE | File: %s | Drive: %.2fs | "
+                "Telegram: %.2fs | Total: %.2fs",
                 filename,
                 download_elapsed,
                 upload_elapsed,
                 download_elapsed + upload_elapsed,
             )
 
+            # Send the main menu AFTER the document so the user can continue.
+            await show_after_file_menu(context, chat_id)
+
         except ValueError as exc:
-
-            logger.warning(
-                "Download rejected: %s",
-                exc,
-            )
-
+            logger.warning("Download rejected: %s", exc)
             await status.edit_text(
                 f"⚠️ {html.escape(str(exc))}",
                 parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
             )
 
         except HttpError:
-
-            logger.exception(
-                "Google Drive download failed"
-            )
-
+            logger.exception("Google Drive download failed")
             await status.edit_text(
                 "❌ Google Drive could not provide this document. "
-                "Check its permissions or try again."
+                "Check its permissions or try again.",
+                reply_markup=main_menu_keyboard(),
             )
 
         except TelegramError:
-
-            logger.exception(
-                "Telegram document upload failed"
-            )
-
+            logger.exception("Telegram document upload failed")
             await status.edit_text(
                 "❌ Telegram could not send this document. "
-                "It may be too large or the upload may have failed."
+                "It may be too large or the upload may have failed.",
+                reply_markup=main_menu_keyboard(),
             )
 
         except Exception:
-
-            logger.exception(
-                "Unexpected download error"
-            )
-
+            logger.exception("Unexpected download error")
             await status.edit_text(
-                "❌ An unexpected error occurred while downloading "
-                "the document."
+                "❌ An unexpected error occurred while downloading the document.",
+                reply_markup=main_menu_keyboard(),
             )
+
+        finally:
+            # Release the in-memory download buffer promptly.
+            try:
+                buffer.close()
+            except (UnboundLocalError, AttributeError):
+                pass
+
+        return
 
 
 # ============================================================
@@ -1423,19 +1163,14 @@ async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
-    logger.error(
-        "Unhandled application error",
-        exc_info=(
-            (
-                type(context.error),
-                context.error,
-                context.error.__traceback__,
-            )
-            if context.error
-            else None
-        ),
-    )
+    error = context.error
+    if error:
+        logger.error(
+            "Unhandled application error",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    else:
+        logger.error("Unhandled application error without exception details.")
 
 
 # ============================================================
@@ -1443,32 +1178,22 @@ async def error_handler(
 # ============================================================
 
 def main():
-
     if not BOT_TOKEN:
-
         raise RuntimeError(
-            "Telegram bot token is missing. "
-            "Set TELEGRAM_BOT_TOKEN in your environment "
-            "or local .env file."
+            "Telegram bot token is missing. Set TELEGRAM_BOT_TOKEN in your "
+            "environment or local .env file."
         )
+
+    init_file_cache()
 
     # Verify Drive access before starting Telegram polling.
-
-    root = get_folder_metadata(
-        ROOT_FOLDER_ID
-    )
+    root = get_folder_metadata(ROOT_FOLDER_ID)
 
     if root.get("mimeType") != FOLDER_MIME:
-
-        raise RuntimeError(
-            "The configured Google Drive root ID is not a folder."
-        )
+        raise RuntimeError("The configured Google Drive root ID is not a folder.")
 
     if root.get("trashed"):
-
-        raise RuntimeError(
-            "The configured Google Drive root folder is in the trash."
-        )
+        raise RuntimeError("The configured Google Drive root folder is in the trash.")
 
     logger.info(
         "Connected to Google Drive library: %s",
@@ -1481,37 +1206,13 @@ def main():
         .build()
     )
 
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_error_handler(error_handler)
 
-    application.add_handler(
-        CommandHandler(
-            "help",
-            help_command,
-        )
-    )
-
-    application.add_handler(
-        CallbackQueryHandler(
-            button_handler
-        )
-    )
-
-    application.add_error_handler(
-        error_handler
-    )
-
-    logger.info(
-        "AAES DIGITAL LIBRARY is running."
-    )
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
+    logger.info("AAES DIGITAL LIBRARY is running.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
