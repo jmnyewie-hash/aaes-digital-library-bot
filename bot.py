@@ -391,7 +391,7 @@ def programme_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "📚 Existing Library",
+                "📚 Aerospace Engineering",
                 callback_data="programme:existing",
             )
         ],
